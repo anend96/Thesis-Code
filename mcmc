@@ -1,0 +1,653 @@
+#!/usr/bin/env python3
+"""
+frb_mcmc_v4_fixed.py
+========================================================
+Bayesian MCMC analysis of FRB 20180916B broadband constraints
+Campaign: SRT_11-24 (PI: A. Anandhu) + September 2023 MWL campaign
+
+Three analysis modules
+  1.  Spectral index fitting  – radio SED (detections + upper limits)
+  2.  Synchrotron-shock model – parameter constraints from optical + X-ray ULs
+  3.  Magnetospheric efficiency – eta_X and eta_opt posterior upper bounds
+
+Sampler: Metropolis-Hastings, 300 000 steps, 40 % burn-in, thinning = 25
+
+References
+----------
+Bethapudi et al. (2022, 2023) -- Effelsberg detections
+Pilia et al. (2020)           -- SRT P-band detections
+Trudu et al. (2023)           -- uGMRT B3 detections
+Pleunis et al. (2021)         -- LOFAR detections
+Gopinath et al. (2024)        -- LOFAR detections
+CHIME/FRB Collaboration (2019, 2020) -- CHIME detections
+Kilpatrick et al. (2023)      -- Gemini optical upper limit
+Scholz et al. (2020)          -- Chandra / Fermi upper limits
+Metzger et al. (2019)         -- External-shock model scalings
+Beloborodov (2020)            -- Shock synchrotron fluence calibration
+Mereghetti et al. (2020)      -- SGR 1935+2154 X-ray event
+"""
+
+import os
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.special import erf
+
+RNG = np.random.default_rng(42)
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+D_L_MPC   = 147.0
+D_L_CM    = D_L_MPC * 3.0857e24
+NU0_HZ    = 1.0e9          # spectral normalisation reference [Hz]
+P_SYNC    = 2.2            # synchrotron electron spectral index
+
+# ============================================================
+# MODULE 0 -- DATA
+# ============================================================
+
+# Upper limits from this work
+# (nu_Hz, nufnu_lim[erg/cm2/s], n_sigma, fluence_lim[erg/cm2], label, band)
+UL_THIS_WORK = [
+    (400e6,   2.0e-15, 6, 2.0e-15*1e-3, "uGMRT B3 400 MHz",   "radio"),
+    (4.6e9,   8.3e-15, 6, 8.3e-15*1e-3, "SRT C-low 4.6 GHz",  "radio"),
+    (6.5e9,   1.2e-14, 6, 1.2e-14*1e-3, "SRT C-high 6.5 GHz", "radio"),
+    (19.0e9,  9.9e-14, 6, 9.9e-14*1e-3, "SRT K-band 19 GHz",  "radio"),
+    (5.5e14,  1.95e-11,5, 3.1e-15,       "AquEYE+ V-band",     "optical"),
+    (2.0e18,  1.64e-8, 3, 1.64e-11,      "LAXPC 1ms 3-80keV",  "xray"),
+]
+
+# Literature radio detections -- detection ranges
+# (nu_Hz, log10_nufnu_min, log10_nufnu_max, label, color)
+LIT_RADIO = [
+    (150e6,  -14.0, -12.0, "LOFAR (Pleunis+21;\nGopinath+24)",     "#4393C3"),
+    (330e6,  -15.0, -13.0, "SRT P-band (Pilia+20)",                "#92C5DE"),
+    (400e6,  -15.0, -12.0, "uGMRT B3 (Trudu+23)",                  "#2166AC"),
+    (600e6,  -15.0, -13.0, "CHIME (CHIME/FRB+19,20)",              "#053061"),
+    (6.0e9,  -14.3, -13.0, "Effelsberg (Bethapudi+22,23)",         "#67001F"),
+]
+
+# Literature optical/X-ray upper limits
+# (nu_Hz, nufnu_lim, n_sig_or_None, label, band)
+LIT_UL = [
+    (5.5e14, 4.5e-12, 3,    "Gemini/'Alopeke (Kilpatrick+23)", "optical"),
+    (1.5e17, 5.0e-7,  None, "Chandra 0.5-10keV (Scholz+20)",   "xray"),
+    (3.0e19, 4.0e-6,  None, "Fermi/GBM 10-100keV (Scholz+20)", "xray"),
+]
+
+# SGR 1935+2154 rescaled to 147 Mpc
+NU_SGR    = 2.0e18
+NUFNU_SGR = 2.6e-24
+
+# Build representative detection data-points for MCMC likelihood
+def _make_det_arrays(lit_radio, n_per_band=6):
+    nus, lognufnus, sigmas = [], [], []
+    for (nu, lmin, lmax, *_) in lit_radio:
+        mid   = 0.5*(lmin + lmax)
+        half  = 0.5*(lmax - lmin)
+        sigma = max(half / 2.0, 0.35)
+        for nu_i in np.linspace(nu*0.8, nu*1.2, n_per_band):
+            nus.append(nu_i)
+            lognufnus.append(mid)
+            sigmas.append(sigma)
+    return np.array(nus), np.array(lognufnus), np.array(sigmas)
+
+NU_DET, LOGNUFNU_DET, SIGMA_DET = _make_det_arrays(LIT_RADIO)
+
+# ============================================================
+# LIKELIHOOD BUILDING BLOCKS
+# ============================================================
+
+def loglike_det(log_nufnu_obs, sigma_obs, log_nufnu_model):
+    """Gaussian log-likelihood for a detection in log10(nuFnu) space."""
+    return -0.5 * ((log_nufnu_obs - log_nufnu_model) / sigma_obs)**2
+
+def loglike_ul(flux_lim, n_sigma, flux_model):
+    """
+    One-sided survival-function log-likelihood for an upper limit.
+    sigma_noise = flux_lim / n_sigma
+    logL = log Phi((flux_lim - flux_model) / sigma_noise)
+    Returns 0 when flux_model << flux_lim, -inf when flux_model >> flux_lim.
+    """
+    sigma_noise = flux_lim / n_sigma
+    z = (flux_lim - flux_model) / (np.sqrt(2.0) * sigma_noise)
+    val = np.log(0.5 * (1.0 + erf(z)))
+    return val if np.isfinite(val) else -1e30
+
+# ============================================================
+# MODULE 1 -- SPECTRAL INDEX FITTING
+# ============================================================
+# Model: log10(nuFnu) = log_norm + (1-alpha)*log10(nu/nu0)
+#        where Snu ~ nu^{-alpha}  =>  nuFnu ~ nu^{1-alpha}
+# Parameters: [log_norm, alpha]
+#   log_norm: U(-17, -11)
+#   alpha:    U(0, 5)
+
+def spec_model(nu, log_norm, alpha):
+    return log_norm + (1.0 - alpha) * np.log10(nu / NU0_HZ)
+
+def logprior_spec(p):
+    log_norm, alpha = p
+    if -17.0 < log_norm < -11.0 and 0.0 < alpha < 5.0:
+        return 0.0
+    return -np.inf
+
+def logpost_spec(p, nu_det, log_nufnu_det, sigma_det, ul_list):
+    lp = logprior_spec(p)
+    if not np.isfinite(lp):
+        return -np.inf
+    log_norm, alpha = p
+    # Detections
+    ll = np.sum(loglike_det(log_nufnu_det, sigma_det,
+                             spec_model(nu_det, log_norm, alpha)))
+    # Radio upper limits
+    for (nu, nufnu_lim, n_sig, fluence, label, band) in ul_list:
+        nufnu_model = 10.0 ** spec_model(nu, log_norm, alpha)
+        ll += loglike_ul(nufnu_lim, n_sig, nufnu_model)
+    return lp + ll
+
+# ============================================================
+# MODULE 2 -- SYNCHROTRON-SHOCK MODEL
+# ============================================================
+# Optical fluence scaling (Metzger+19; Beloborodov 2020):
+#   F_opt = F_ref * (Ek/Ek_ref)^a * (epsB/epsB_ref)^b * (n/n_ref)^c
+# Calibration: F_ref=1e-12 erg/cm2 at Ek=1e44, epsB=0.01, n=1, D=147Mpc, dt=1ms
+# Parameters: [log_Ek, log_eps_B, log_n]
+#   log_Ek:    U(42, 47)
+#   log_eps_B: U(-4,  0)
+#   log_n:     U(-5,  2)
+
+_A = (P_SYNC + 3.0) / 4.0   # = 1.30
+_B = (P_SYNC + 1.0) / 4.0   # = 0.80
+_C = 0.5
+_F_REF   = 1.0e-12
+_EK_REF  = 1.0e44
+_EB_REF  = 1.0e-2
+_N_REF   = 1.0
+
+def shock_F_opt(log_Ek, log_epsB, log_n):
+    """Predicted optical fluence [erg/cm2] at 147 Mpc, dt=1ms."""
+    return (_F_REF
+            * (10.0**log_Ek   / _EK_REF) ** _A
+            * (10.0**log_epsB / _EB_REF) ** _B
+            * (10.0**log_n    / _N_REF)  ** _C)
+
+def shock_F_xray(log_Ek, log_epsB, log_n):
+    """
+    Predicted 3-80 keV fluence [erg/cm2] at 147 Mpc, dt=1ms.
+    The synchrotron peak lies near optical for typical parameters;
+    the 3-80 keV band is above the cooling break -> F_X ~ 1% of F_opt
+    (conservative, consistent with Beloborodov 2020 Fig. 3).
+    """
+    return 0.01 * shock_F_opt(log_Ek, log_epsB, log_n)
+
+def logprior_shock(p):
+    log_Ek, log_epsB, log_n = p
+    if 42.0 < log_Ek < 47.0 and -4.0 < log_epsB < 0.0 and -5.0 < log_n < 2.0:
+        return 0.0
+    return -np.inf
+
+def logpost_shock(p, F_opt_lim, n_sig_opt, F_xray_lim, n_sig_xray):
+    lp = logprior_shock(p)
+    if not np.isfinite(lp):
+        return -np.inf
+    log_Ek, log_epsB, log_n = p
+    ll  = loglike_ul(F_opt_lim,  n_sig_opt,  shock_F_opt( log_Ek, log_epsB, log_n))
+    ll += loglike_ul(F_xray_lim, n_sig_xray, shock_F_xray(log_Ek, log_epsB, log_n))
+    return lp + ll
+
+# ============================================================
+# MODULE 3 -- MAGNETOSPHERIC EFFICIENCY
+# ============================================================
+# Model: E_X   = eta_X   * E_radio
+#        E_opt = eta_opt * E_radio
+# Parameters: [log_eta_X, log_eta_opt, log_E_radio]
+#   log_eta_X:    U(-3, 10)
+#   log_eta_opt:  U(-7,  5)
+#   log_E_radio:  U(35, 40)   (Effelsberg: ~1e36-1e38 erg)
+# Constraints:
+#   LAXPC:   E_X   < 4.24e43 erg (3sigma)
+#   AquEYE+: E_opt < 8.1e39 erg  (5sigma)
+
+def logprior_eff(p):
+    leX, leO, leR = p
+    if -3.0 < leX < 10.0 and -7.0 < leO < 5.0 and 35.0 < leR < 40.0:
+        return 0.0
+    return -np.inf
+
+def logpost_eff(p, E_X_lim, n_sig_X, E_opt_lim, n_sig_opt):
+    lp = logprior_eff(p)
+    if not np.isfinite(lp):
+        return -np.inf
+    leX, leO, leR = p
+    E_r = 10.0**leR
+    ll  = loglike_ul(E_X_lim,   n_sig_X,   10.0**leX * E_r)
+    ll += loglike_ul(E_opt_lim, n_sig_opt, 10.0**leO * E_r)
+    return lp + ll
+
+# ============================================================
+# METROPOLIS-HASTINGS SAMPLER
+# ============================================================
+
+def metropolis_hastings(logpost_fn, p0, proposal_sigma,
+                        n_steps=300_000, burn_frac=0.40, thin=25, **kw):
+    """
+    Metropolis-Hastings sampler with Gaussian proposals.
+
+    Parameters
+    ----------
+    logpost_fn     : callable -- log-posterior(params, **kw)
+    p0             : array    -- starting position
+    proposal_sigma : array    -- per-parameter Gaussian widths
+    n_steps        : int      -- total iterations (default 300 000)
+    burn_frac      : float    -- burn-in fraction  (default 0.40)
+    thin           : int      -- thinning factor   (default 25)
+    **kw passed verbatim to logpost_fn
+
+    Returns
+    -------
+    chain       : ndarray (n_kept, n_params)
+    accept_rate : float
+    """
+    p_cur  = np.asarray(p0, float)
+    lp_cur = logpost_fn(p_cur, **kw)
+    full   = np.empty((n_steps, len(p_cur)))
+    n_acc  = 0
+
+    for i in range(n_steps):
+        p_prop = p_cur + RNG.standard_normal(len(p_cur)) * proposal_sigma
+        lp_prop = logpost_fn(p_prop, **kw)
+        if np.log(RNG.uniform()) < lp_prop - lp_cur:
+            p_cur, lp_cur = p_prop, lp_prop
+            n_acc += 1
+        full[i] = p_cur
+
+    burn  = int(burn_frac * n_steps)
+    return full[burn::thin], n_acc / n_steps
+
+# ============================================================
+# CORNER PLOT UTILITY (pure matplotlib, no external deps)
+# ============================================================
+
+def corner_plot(chain, labels, truths=None):
+    n = chain.shape[1]
+    fig, axes = plt.subplots(n, n, figsize=(3.2*n, 3.2*n))
+    if n == 1:
+        axes = np.array([[axes]])
+
+    for row in range(n):
+        for col in range(n):
+            ax = axes[row, col]
+            if col > row:
+                ax.set_visible(False)
+                continue
+            x = chain[:, col]
+            y = chain[:, row]
+            if row == col:
+                ax.hist(x, bins=55, density=True, color="#4393C3",
+                        histtype="stepfilled", alpha=0.75, lw=0)
+                ax.hist(x, bins=55, density=True, color="#1B4F72",
+                        histtype="step", lw=1.0)
+                q16, q50, q84 = np.percentile(x, [16, 50, 84])
+                ax.axvline(q50, color="k",        lw=1.5)
+                ax.axvline(q16, color="k",        lw=0.9, ls="--")
+                ax.axvline(q84, color="k",        lw=0.9, ls="--")
+                if truths is not None and truths[col] is not None:
+                    ax.axvline(truths[col], color="orangered", lw=1.8, ls=":")
+                ax.set_title(f"{labels[col]}\n"
+                             f"${q50:.2f}^{{+{q84-q50:.2f}}}_{{-{q50-q16:.2f}}}$",
+                             fontsize=8, pad=3)
+                ax.set_yticks([])
+            else:
+                ax.hexbin(x, y, gridsize=35, cmap="Blues",
+                          mincnt=1, linewidths=0.2)
+                if truths is not None:
+                    if truths[col] is not None:
+                        ax.axvline(truths[col], color="orangered", lw=1, ls=":")
+                    if truths[row] is not None:
+                        ax.axhline(truths[row], color="orangered", lw=1, ls=":")
+
+            if row == n-1:
+                ax.set_xlabel(labels[col], fontsize=9)
+            else:
+                ax.set_xticklabels([])
+            if col == 0 and row != 0:
+                ax.set_ylabel(labels[row], fontsize=9)
+            else:
+                ax.set_yticklabels([])
+
+    plt.subplots_adjust(hspace=0.06, wspace=0.06)
+    return fig
+
+# ============================================================
+# PLOT A -- BROADBAND SED
+# ============================================================
+
+def plot_sed(chain_spec, out):
+    fig, ax = plt.subplots(figsize=(11.5, 6.5))
+    nu_grid = np.logspace(7.5, 19.5, 400)
+
+    # posterior band
+    idx = RNG.integers(0, len(chain_spec), 350)
+    for i in idx:
+        ln, al = chain_spec[i]
+        ax.plot(nu_grid, 10.0**spec_model(nu_grid, ln, al),
+                color="#F39C12", alpha=0.04, lw=0.5)
+
+    med_ln, med_al = np.median(chain_spec, axis=0)
+    ax.plot(nu_grid, 10.0**spec_model(nu_grid, med_ln, med_al),
+            color="darkorange", lw=2.2, ls="--",
+            label=fr"MCMC median: $\alpha = {med_al:.2f}$")
+    ax.plot(nu_grid, 10.0**spec_model(nu_grid, med_ln, 1.4),
+            color="grey", lw=1.4, ls=":", alpha=0.7,
+            label=r"$\alpha = 1.4$ (Bethapudi+23)")
+
+    # Literature detection bands
+    for (nu, lmin, lmax, label, col) in LIT_RADIO:
+        ax.fill_between([nu*0.72, nu*1.38],
+                        [10**lmin]*2, [10**lmax]*2,
+                        alpha=0.32, color=col, zorder=2)
+    ax.fill_between([], [], [], alpha=0.35, color="#2166AC",
+                    label="Radio detections (literature)")
+
+    # Literature ULs
+    for (nu, nufnu_lim, n_sig, label, band) in LIT_UL:
+        col = "#922B21" if band == "optical" else "#6C3483"
+        ax.plot(nu, nufnu_lim, "v", color=col, ms=8, alpha=0.5, zorder=4)
+        ax.annotate("", xy=(nu, nufnu_lim*0.38), xytext=(nu, nufnu_lim),
+                    arrowprops=dict(arrowstyle="-|>", color=col, lw=1.2, alpha=0.5))
+
+    # This-work ULs
+    colors_band = {"radio": "#1B4F72", "optical": "#922B21", "xray": "#6C3483"}
+    for (nu, nufnu_lim, n_sig, fluence, label, band) in UL_THIS_WORK:
+        col = colors_band[band]
+        ax.plot(nu, nufnu_lim, "v", color=col, ms=11, zorder=6, mew=0)
+        ax.annotate("", xy=(nu, nufnu_lim*0.40), xytext=(nu, nufnu_lim),
+                    arrowprops=dict(arrowstyle="-|>", color=col, lw=2.0))
+        ax.text(nu, nufnu_lim*1.7,
+                label.replace(" ", "\n"), ha="center", va="bottom",
+                fontsize=6.0, color=col)
+
+    ax.plot([], [], "v", color="#1B4F72", ms=10, label="Radio ULs, this work (6σ)")
+    ax.plot([], [], "v", color="#922B21", ms=10, label="Optical UL, this work (5σ)")
+    ax.plot([], [], "v", color="#6C3483", ms=10, label="LAXPC X-ray UL, this work (3σ)")
+
+    # SGR 1935+2154
+    ax.scatter(NU_SGR, NUFNU_SGR, marker="*", s=260,
+               color="gold", edgecolors="k", lw=0.6, zorder=8,
+               label="SGR 1935+2154 @ 147 Mpc")
+
+    for txt, nu_t, y_t in [("Radio", 6e8, 3e-7),
+                            ("Optical", 5e14, 3e-7),
+                            ("X-ray", 5e17, 3e-7)]:
+        ax.text(nu_t, y_t, txt, fontsize=9, color="0.45", ha="center")
+
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlim(3e7, 5e19); ax.set_ylim(3e-27, 3e-6)
+    ax.set_xlabel(r"Frequency $\nu$ [Hz]", fontsize=13)
+    ax.set_ylabel(r"$\nu F_\nu$ [erg cm$^{-2}$ s$^{-1}$]", fontsize=13)
+    ax.set_title("FRB 20180916B — Broadband SED with MCMC spectral index posterior",
+                 fontsize=12)
+    ax.legend(fontsize=8, ncol=2, loc="lower left", framealpha=0.88, edgecolor="0.7")
+    plt.tight_layout()
+    for ext in ("pdf", "png"):
+        fig.savefig(f"{out}/sed_mcmc.{ext}", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("  -> sed_mcmc.pdf / .png")
+
+# ============================================================
+# PLOT B -- SPECTRAL INDEX CORNER
+# ============================================================
+
+def plot_spec_corner(chain_spec, out):
+    fig = corner_plot(chain_spec,
+                      labels=[r"$\log_{10}(A)$ [erg cm$^{-2}$ s$^{-1}$]",
+                               r"Spectral index $\alpha$"],
+                      truths=[None, 1.4])
+    fig.suptitle("Spectral index posterior   (orange dashed = literature alpha=1.4)",
+                 fontsize=10, y=1.01)
+    for ext in ("pdf", "png"):
+        fig.savefig(f"{out}/spectral_corner.{ext}", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("  -> spectral_corner.pdf / .png")
+
+# ============================================================
+# PLOT C -- SHOCK MODEL
+# ============================================================
+
+def plot_shock(chain_shock, out):
+    labels_sh = [r"$\log_{10}(E_k /$ erg)",
+                 r"$\log_{10}(\epsilon_B)$",
+                 r"$\log_{10}(n /$ cm$^{-3}$)"]
+    fig = corner_plot(chain_shock, labels=labels_sh)
+    fig.suptitle("Shock model posterior   (AquEYE+ optical + LAXPC X-ray ULs)",
+                 fontsize=10, y=1.01)
+    for ext in ("pdf", "png"):
+        fig.savefig(f"{out}/shock_corner.{ext}", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("  -> shock_corner.pdf / .png")
+
+    # 2-D constraint maps
+    log_Ek, log_eB, log_n = chain_shock.T
+    fig2, axes = plt.subplots(1, 3, figsize=(15, 5))
+    pairs = [
+        (log_Ek, log_eB, labels_sh[0], labels_sh[1], [42,47], [-4,0]),
+        (log_Ek, log_n,  labels_sh[0], labels_sh[2], [42,47], [-5,2]),
+        (log_eB, log_n,  labels_sh[1], labels_sh[2], [-4,0],  [-5,2]),
+    ]
+    for ax, (x, y, xl, yl, xr, yr) in zip(axes, pairs):
+        h = ax.hexbin(x, y, gridsize=45, cmap="YlGnBu", mincnt=1, linewidths=0.2)
+        plt.colorbar(h, ax=ax, label="Counts")
+        ax.set_xlabel(xl, fontsize=11); ax.set_ylabel(yl, fontsize=11)
+        ax.set_xlim(xr); ax.set_ylim(yr)
+
+    # AquEYE+ exclusion boundary in (Ek, epsB) plane (fixed n=n_ref=1)
+    Ek_line = np.linspace(42, 47, 200)
+    log_eB_boundary = (np.log10(3.1e-15 / _F_REF)
+                       - _A * (Ek_line - np.log10(_EK_REF))) / _B + np.log10(_EB_REF)
+    axes[0].plot(Ek_line, log_eB_boundary, color="orangered", lw=2.2, ls="--",
+                 label="AquEYE+ exclusion boundary\n(n = 1 cm$^{-3}$)")
+    mask = log_eB_boundary <= 0.0
+    if mask.any():
+        axes[0].fill_between(Ek_line[mask], log_eB_boundary[mask], 0.0,
+                             alpha=0.18, color="orangered")
+    axes[0].legend(fontsize=8)
+
+    fig2.suptitle("FRB 20180916B -- Shock model: 2D marginalised parameter space",
+                  fontsize=11, y=1.01)
+    plt.tight_layout()
+    for ext in ("pdf", "png"):
+        fig2.savefig(f"{out}/shock_2d.{ext}", dpi=150, bbox_inches="tight")
+    plt.close(fig2)
+    print("  -> shock_2d.pdf / .png")
+
+# ============================================================
+# PLOT D -- EFFICIENCY POSTERIORS
+# ============================================================
+
+def plot_efficiency(chain_eff, out):
+    fig = corner_plot(chain_eff,
+                      labels=[r"$\log_{10}(\eta_X)$",
+                               r"$\log_{10}(\eta_{\rm opt})$",
+                               r"$\log_{10}(E_{\rm radio} /$ erg)"])
+    fig.suptitle("Magnetospheric efficiency posterior", fontsize=10, y=1.01)
+    for ext in ("pdf", "png"):
+        fig.savefig(f"{out}/efficiency_corner.{ext}", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("  -> efficiency_corner.pdf / .png")
+
+    log_etaX, log_etaO, _ = chain_eff.T
+    fig2, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    for ax, data, xlabel, sgr_val in [
+        (axes[0], log_etaX, r"$\log_{10}(\eta_X = E_X / E_{\rm radio})$",     5.0),
+        (axes[1], log_etaO, r"$\log_{10}(\eta_{\rm opt} = E_{\rm opt} / E_{\rm radio})$", None),
+    ]:
+        ax.hist(data, bins=70, density=True, color="#1B7837",
+                histtype="stepfilled", alpha=0.70, edgecolor="white", lw=0.4)
+        q16, q50, q84 = np.percentile(data, [16, 50, 84])
+        ax.axvline(q50, color="navy",     lw=1.8, ls=":",
+                   label=f"Median = {q50:.2f}")
+        ax.axvline(q84, color="orangered",lw=2.2, ls="--",
+                   label=f"84th pct (UL) = {q84:.2f}")
+        if sgr_val is not None:
+            ax.axvline(sgr_val, color="goldenrod", lw=2.5,
+                       label=r"SGR 1935+2154: $\eta_X \gtrsim 10^5$")
+        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_ylabel("Posterior density", fontsize=11)
+        ax.legend(fontsize=9)
+
+    axes[0].set_title(r"LAXPC: $E_X^{\rm iso} < 4.24\times10^{43}$ erg (3$\sigma$, 1 ms)",
+                      fontsize=9)
+    axes[1].set_title(r"AquEYE+: $E_{\rm opt}^{\rm iso} < 8.1\times10^{39}$ erg (5$\sigma$, 1 ms)",
+                      fontsize=9)
+    fig2.suptitle("FRB 20180916B -- Magnetospheric efficiency constraints vs. SGR 1935+2154",
+                  fontsize=11)
+    plt.tight_layout()
+    for ext in ("pdf", "png"):
+        fig2.savefig(f"{out}/efficiency_marginals.{ext}", dpi=150, bbox_inches="tight")
+    plt.close(fig2)
+    print("  -> efficiency_marginals.pdf / .png")
+
+# ============================================================
+# PLOT E -- TRACE PLOTS (convergence diagnostics)
+# ============================================================
+
+def plot_traces(chains, labels_list, names, out):
+    for chain, labels, name in zip(chains, labels_list, names):
+        n_p = chain.shape[1]
+        fig, axes = plt.subplots(n_p, 1, figsize=(10, 2.5*n_p), sharex=True)
+        if n_p == 1:
+            axes = [axes]
+        for ax, col, lab in zip(axes, chain.T, labels):
+            ax.plot(col, lw=0.4, color="steelblue", alpha=0.9)
+            ax.axhline(np.median(col), color="orangered", lw=1.0, ls="--")
+            ax.set_ylabel(lab, fontsize=9)
+        axes[-1].set_xlabel("Thinned sample index", fontsize=10)
+        fig.suptitle(f"Trace plot -- {name}", fontsize=11)
+        plt.tight_layout()
+        safe = name.lower().replace(" ", "_")
+        for ext in ("pdf", "png"):
+            fig.savefig(f"{out}/trace_{safe}.{ext}", dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  -> trace_{safe}.pdf / .png")
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    OUT = "/mnt/user-data/outputs/mcmc_outputs"
+    os.makedirs(OUT, exist_ok=True)
+
+    N_STEPS = 300_000
+    BURN    = 0.40
+    THIN    = 25
+
+    print("=" * 65)
+    print("  FRB 20180916B -- Broadband MCMC Analysis (frb_mcmc_v4_fixed)")
+    print("  SRT_11-24 + September 2023 MWL campaign")
+    print("=" * 65)
+
+    # ── 1. Spectral index ────────────────────────────────────────
+    print("\n[1/3] Spectral index fitting ...")
+    radio_uls = [u for u in UL_THIS_WORK if u[5] == "radio"]
+    chain_spec, ar_spec = metropolis_hastings(
+        logpost_spec,
+        p0=np.array([-14.5, 1.4]),
+        proposal_sigma=np.array([0.15, 0.09]),
+        n_steps=N_STEPS, burn_frac=BURN, thin=THIN,
+        nu_det=NU_DET, log_nufnu_det=LOGNUFNU_DET,
+        sigma_det=SIGMA_DET, ul_list=radio_uls,
+    )
+    print(f"  Accept rate : {ar_spec:.3f}   Thinned samples : {len(chain_spec)}")
+    q16, q50, q84 = np.percentile(chain_spec[:, 1], [16, 50, 84])
+    print(f"  alpha = {q50:.3f}  +{q84-q50:.3f} / -{q50-q16:.3f}  (68% CI)")
+
+    # ── 2. Shock model ───────────────────────────────────────────
+    print("\n[2/3] Shock model constraints ...")
+    chain_shock, ar_shock = metropolis_hastings(
+        logpost_shock,
+        p0=np.array([44.5, -2.0, -1.0]),
+        proposal_sigma=np.array([0.45, 0.30, 0.40]),
+        n_steps=N_STEPS, burn_frac=BURN, thin=THIN,
+        F_opt_lim=3.1e-15,  n_sig_opt=5,
+        F_xray_lim=1.64e-11, n_sig_xray=3,
+    )
+    print(f"  Accept rate : {ar_shock:.3f}   Thinned samples : {len(chain_shock)}")
+    for i, nm in enumerate(["log_Ek", "log_eps_B", "log_n"]):
+        q16, q50, q84 = np.percentile(chain_shock[:, i], [16, 50, 84])
+        print(f"  {nm:12s} = {q50:.2f}  +{q84-q50:.2f} / -{q50-q16:.2f}")
+
+    # ── 3. Efficiency ────────────────────────────────────────────
+    print("\n[3/3] Magnetospheric efficiency constraints ...")
+    chain_eff, ar_eff = metropolis_hastings(
+        logpost_eff,
+        p0=np.array([4.5, 1.0, 37.0]),
+        proposal_sigma=np.array([0.50, 0.45, 0.28]),
+        n_steps=N_STEPS, burn_frac=BURN, thin=THIN,
+        E_X_lim=4.24e43, n_sig_X=3,
+        E_opt_lim=8.10e39, n_sig_opt=5,
+    )
+    print(f"  Accept rate : {ar_eff:.3f}   Thinned samples : {len(chain_eff)}")
+    for i, nm in enumerate(["log_eta_X", "log_eta_opt", "log_E_radio"]):
+        q16, q50, q84 = np.percentile(chain_eff[:, i], [16, 50, 84])
+        print(f"  {nm:15s} = {q50:.2f}  +{q84-q50:.2f} / -{q50-q16:.2f}")
+
+    # ── Plots ────────────────────────────────────────────────────
+    print("\n[Plotting] ...")
+    plt.rcParams.update({"font.size": 11, "figure.dpi": 150, "axes.linewidth": 0.8})
+
+    plot_sed(chain_spec, OUT)
+    plot_spec_corner(chain_spec, OUT)
+    plot_shock(chain_shock, OUT)
+    plot_efficiency(chain_eff, OUT)
+    plot_traces(
+        [chain_spec, chain_shock, chain_eff],
+        [[r"$\log_{10}(A)$", r"$\alpha$"],
+         [r"$\log_{10}(E_k)$", r"$\log_{10}(\epsilon_B)$", r"$\log_{10}(n)$"],
+         [r"$\log_{10}(\eta_X)$", r"$\log_{10}(\eta_{\rm opt})$", r"$\log_{10}(E_{\rm radio})$"]],
+        ["Spectral", "Shock", "Efficiency"],
+        OUT,
+    )
+
+    # ── Save chains ──────────────────────────────────────────────
+    np.save(f"{OUT}/chain_spectral.npy",   chain_spec)
+    np.save(f"{OUT}/chain_shock.npy",      chain_shock)
+    np.save(f"{OUT}/chain_efficiency.npy", chain_eff)
+    print(f"\n  -> Chains saved to {OUT}/")
+
+    # ── Summary ──────────────────────────────────────────────────
+    print("\n" + "="*65)
+    print("  SUMMARY")
+    print("="*65)
+
+    q16, q50, q84 = np.percentile(chain_spec[:, 1], [16, 50, 84])
+    print(f"\n  Spectral index:  alpha = {q50:.2f} +{q84-q50:.2f}/-{q50-q16:.2f}")
+    print(f"  Literature ref:  alpha = 1.4 +/- 0.3  (Bethapudi+23)")
+
+    p84_Ek = np.percentile(chain_shock[:, 0], 84)
+    p84_eB = np.percentile(chain_shock[:, 1], 84)
+    print(f"\n  Shock model (84th pct, marginalised):")
+    print(f"    log_Ek  < {p84_Ek:.1f}  ( {10**p84_Ek:.1e} erg )")
+    print(f"    log_epsB < {p84_eB:.2f}")
+
+    q84_etaX = np.percentile(chain_eff[:, 0], 84)
+    q84_etaO = np.percentile(chain_eff[:, 1], 84)
+    print(f"\n  Efficiency upper bounds (84th pct):")
+    print(f"    eta_X   < 10^{q84_etaX:.1f}  (LAXPC, 3sigma, 1ms)")
+    print(f"    eta_opt < 10^{q84_etaO:.1f}  (AquEYE+, 5sigma, 1ms)")
+    print(f"    SGR 1935+2154 reference: eta_X > 10^5.0")
+    if q84_etaX < 5.0:
+        print("    *** eta_X bound is BELOW SGR reference ***")
+    else:
+        print(f"    eta_X bound consistent with SGR analogy (UL > 5.0)")
+
+    print("\n  All outputs saved to:", OUT)
+    print("="*65)
+
+
+if __name__ == "__main__":
+    main()
